@@ -1,0 +1,76 @@
+# Build directories
+build/
+out/
+bin/
+lib/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+CMakeUserPresets.json
+CMakePresets.json
+
+# CMake external dependencies
+_deps/
+
+# Compiled Object files
+*.o
+*.obj
+*.ko
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Compiled Static libraries
+*.a
+*.lib
+*.la
+*.lo
+
+# Executables
+*.exe
+*.out
+*.app
+
+# IDE specific files
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Dependency files
+*.d
+*.o.d
+*.ts
+
+# Generated files
+*.generated.*
+
+# Vulkan shaders (compiled)
+*.spv
+
+# ImGui
+imgui.ini
+
+# Package managers
+node_modules/
+vendor/
