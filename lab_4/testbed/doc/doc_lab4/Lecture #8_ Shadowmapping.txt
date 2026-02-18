@@ -1,0 +1,419 @@
+C O M P U T E R    G R A P H I C S
+Маппинг теней
+
+
+Объявляем всё, что нужно для теней
+struct {
+// Объекты для изображения, куда будет записываться информация о глубине
+	VkFormat depth_image_format;
+	VkImage depth_image;
+	VkDeviceMemory depth_image_memory;
+	VkImageView depth_image_view;
+
+	VkShaderModule vertex_shader; // Простой шейдер для трансформации геометрии и не больше
+
+	// Объекты графического конвейера и описания ресурсов шейдера для записи глубины в текстуру
+	VkDescriptorSetLayout descriptor_set_layout;
+	VkDescriptorSet descriptor_set;
+	VkPipelineLayout pipeline_layout;
+	VkPipeline pipeline;
+
+	veekay::graphics::Buffer* uniform_buffer; // Буфер для единственной матрицы проекции теней
+VkSampler sampler; // Специальный сэмплер для текстуры (карты) теней
+
+	veekay::mat4 matrix; // Сама матрица проекции теней
+} shadow;
+
+Создаем изображение для записи туда глубины 
+Объявляем константу размера текстуры глубины, это будет наше разрешение, чем больше – тем менее мыльно
+constexpr uint32_t shadow_map_size = 4096;
+
+Инициализируем объекты VkFormat, VkImage, VkDeviceMemory, VkImageView так же, как на лекции ранее, только теперь размер изображения будет квадратный:
+Подбор оптимального формата из кандидатов для VkFormat
+Создание объекта изображения VkImage
+Аллокация памяти и ее привязка к изображению VkDeviceMemory
+Создание логического изображения VkImageView 
+
+Далее начинаем описывать свойства нового графического конвейера специально для записи глубины рисуемой сцены
+
+Единственный вершинный шейдер 
+shadow.vertex_shader =
+loadShaderModule("./shaders/shadow.vert.spv");
+		
+VkPipelineShaderStageCreateInfo stage_infos[1];
+
+stage_infos[0] = VkPipelineShaderStageCreateInfo{
+	.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+	.stage = VK_SHADER_STAGE_VERTEX_BIT,
+	.module = shadow.vertex_shader,
+	.pName = "main",
+};
+
+
+Вершинный шейдер для конвейера генератора тени
+#version 450
+
+layout (location = 0) in vec3 v_position;
+
+layout (binding = 0, std140) uniform ShadowUniforms {
+	mat4 shadow_projection;
+};
+
+layout (binding = 1, std140) uniform ModelUniforms {
+	mat4 model;
+};
+
+void main() {
+	gl_Position = shadow_projection * model * vec4(v_position, 1.0f);
+}
+
+
+Используем только один атрибут вершины
+VkVertexInputBindingDescription buffer_binding{
+	.binding = 0,
+	.stride = sizeof(Vertex),
+	.inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+};
+
+VkVertexInputAttributeDescription attributes[] = {
+	{ // Нам нужна только позиция вершины
+		.location = 0,
+		.binding = 0,
+		.format = VK_FORMAT_R32G32B32_SFLOAT,
+		.offset = offsetof(Vertex, position),
+	},
+};
+
+VkPipelineVertexInputStateCreateInfo input_state_info{
+	.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+	.vertexBindingDescriptionCount = 1,
+	.pVertexBindingDescriptions = &buffer_binding,
+	.vertexAttributeDescriptionCount = sizeof(attributes) / sizeof(attributes[0]),
+	.pVertexAttributeDescriptions = attributes,
+};
+
+VkPipelineRasterizationStateCreateInfo raster_info{
+	.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+	.polygonMode = VK_POLYGON_MODE_FILL,
+	.cullMode = VK_CULL_MODE_FRONT_BIT, // Отсекаем передние треугольники
+	.frontFace = VK_FRONT_FACE_CLOCKWISE,
+	.depthBiasEnable = true, // Включаем смещение при записи глубины
+	.lineWidth = 1.0f,
+};
+
+VkPipelineColorBlendStateCreateInfo blend_info{
+	.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+	// Мы не записываем цвет, поэтому убрана маска записи каналов цвета
+};
+
+VkPipelineRenderingCreateInfoKHR format_info{
+	.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR,
+// Мы не записываем цвет, поэтому убрано описание формата пикселей изображения цвета
+	.depthAttachmentFormat = shadow.depth_image_format,
+};
+Описание параметров растеризации глубины
+
+Добавляем смещение в регулируемые параметры
+VkDynamicState dyn_states[] = {
+	VK_DYNAMIC_STATE_VIEWPORT,
+	VK_DYNAMIC_STATE_SCISSOR,
+	// Параметр смещения глубины является регулируемым
+	VK_DYNAMIC_STATE_DEPTH_BIAS,
+};
+
+VkPipelineDynamicStateCreateInfo dyn_state_info{
+	.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+	.dynamicStateCount = sizeof(dyn_states) / sizeof(dyn_states[0]),
+	.pDynamicStates = dyn_states,
+};
+
+Для шейдера теней нужны только две uniform структуры
+VkDescriptorSetLayoutBinding bindings[] = {
+	{ // Тут будет матрица проекции для теневой текстуры
+		.binding = 0,
+		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+		.descriptorCount = 1,
+		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+},
+	{ // Тут будет структура информации про модель (ModelUniforms)
+		.binding = 1,
+		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+		.descriptorCount = 1,
+		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+	},
+};
+
+VkDescriptorSetLayoutCreateInfo info{
+	.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+	.bindingCount = sizeof(bindings) / sizeof(bindings[0]),
+	.pBindings = bindings,
+};
+
+vkCreateDescriptorSetLayout(device, &info, nullptr, &shadow.descriptor_set_layout);
+
+Создание объекта описания используемых дескрипторов для нового конвейера и сам набор дескрипторов
+
+// Специальный набор дескрипторов для шейдера записи глубины 
+shadow.descriptor_set = allocateDescriptorSet(
+descriptor_pool, shadow.descriptor_set_layout);
+
+VkPipelineLayoutCreateInfo layout_info{
+	.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+	.setLayoutCount = 1,
+	.pSetLayouts = &shadow.descriptor_set_layout,
+};
+
+vkCreatePipelineLayout(device, &layout_info, nullptr,
+                       &shadow.pipeline_layout);
+
+Создаем новый конвейер для записи глубины
+// Остальные структуры описания нужны, но они идентичны основному конвейеру и для
+// краткости на слайдах их нет
+VkGraphicsPipelineCreateInfo info{
+	.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+	.pNext = &format_info,
+	.stageCount = sizeof(stage_infos) / sizeof(stage_infos[0]),
+	.pStages = stage_infos,
+	.pVertexInputState = &input_state_info,
+	.pInputAssemblyState = &assembly_state_info,
+	.pViewportState = &viewport_info,
+	.pRasterizationState = &raster_info,
+	.pMultisampleState = &sample_info,
+	.pDepthStencilState = &depth_info,
+	.pColorBlendState = &blend_info,
+	.pDynamicState = &dyn_state_info,
+	.layout = shadow.pipeline_layout,
+};
+
+vkCreateGraphicsPipelines(device, nullptr, 1, &info, nullptr, &shadow.pipeline);
+
+Создаем специальный сэмплер для текстуры глубины
+VkSamplerCreateInfo info{
+	.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+	.magFilter = VK_FILTER_LINEAR,
+	.minFilter = VK_FILTER_LINEAR,
+	.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+	// Если вышли за пределы текстурных координат, то рисуем цвет бортика
+	.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
+	.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
+	.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+// Текстура поддерживает сравнение глубины
+	.compareEnable = true,
+	.compareOp = VK_COMPARE_OP_LESS,
+	.minLod = 0.0f,
+	.maxLod = VK_LOD_CLAMP_NONE,
+	// Если вышли за пределы текстурных координат, рисуем белый цвет бортика???
+	.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE,
+};
+
+vkCreateSampler(device, &info, nullptr, &shadow.sampler);
+
+Создаем новый uniform буфер для матрицы проекции теней
+и свяжем набор дескрипторов с буферами 
+
+shadow.uniform_buffer = new veekay::graphics::Buffer(
+	sizeof(veekay::mat4), nullptr,
+VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+
+
+VkDescriptorBufferInfo buffer_infos[] = {
+{
+		.buffer = shadow.uniform_buffer->buffer,
+		.range = sizeof(veekay::mat4),
+	},
+	{
+		.buffer = model_uniforms_buffer->buffer,
+		.range = sizeof(ModelUniforms),
+	},
+};
+
+Создаем новый uniform буфер для матрицы проекции теней
+и свяжем набор дескрипторов с буферами 
+
+
+VkWriteDescriptorSet write_infos[] = {
+	{ // Тут матрица проекции для теневой текстуры
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.dstSet = shadow.descriptor_set,
+		.dstBinding = 0,
+		.descriptorCount = 1,
+		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+		.pBufferInfo = &buffer_infos[0],
+	},
+{ // Тут структура информации про модель (ModelUniforms)
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.dstSet = shadow.descriptor_set,
+		.dstBinding = 1,
+		.descriptorCount = 1,
+		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+		.pBufferInfo = &buffer_infos[1],
+	},
+};
+
+vkUpdateDescriptorSets(device, sizeof(write_infos) / sizeof(write_infos[0]),
+                       write_infos, 0, nullptr);
+
+Инициализируем матрицу проекции теней
+В update():
+shadow.matrix = lookAt() * ortho();
+
+*reinterpret_cast<veekay::mat4*>(shadow.uniform_buffer->mapped_region) =
+shadow.matrix;
+
+Ортографическая матрица должна иметь объем вытянутого куба в глубину
+Минимальная глубина может быть 1.0, а максимальная глубина должна быть не меньше расстояния от источника света до объектов, иначе объекты просто не будут отбрасывать тень
+Размер куба ортографической проекции диктует площадь охвата тени и, соответственно, разрешение текселя текстуры тени на площадь геометрии
+Позиция Look-At должна быть удалена от камеры в сторону источника света и смотреть на точку позиции камеры. Теперь тень будет “идти” за камерой.
+
+Рисуем в текстуру глубины
+В render() до того, как рисовать основную геометрию (т.е. vkCmdBeginRenderPass):
+Используем барьер, чтобы перевести изображение глубины в оптимальный формат для записи туда конвейером (см. предыдущую лекцию)
+Начинаем динамический рендеринг (vkCmdBeginRenderingKHR) с текстурой глубины
+Выставляем динамические параметры viewport, scissor и depth bias
+Используем новый конвейер для рисования глубины сцены (shadow.pipeline)
+Рисуем геометрию как раньше: пробегаемся по всем моделям, делаем vkCmdBind вершинных и индексных буферов. В качестве используемого набора дескрипторов используем тот, что был создан специально для нового конвейера (shadow.descriptor_set)
+Заканчиваем динамический рендеринг (vkCmdEndRenderingKHR)
+Используем барьер, чтобы перевести изображение глубины в оптимальный формат для чтения из шейдера
+
+Начинаем динамический рендеринг для записи глубины
+VkRenderingAttachmentInfoKHR depth_attachment{
+	.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR,
+	.imageView = shadow.depth_image_view,
+	.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+	.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+	.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+	.clearValue = { .depthStencil = {1.0f, 0} },
+};
+
+VkRenderingInfoKHR rendering_info{
+	.sType = VK_STRUCTURE_TYPE_RENDERING_INFO_KHR,
+	.renderArea = {0, 0, shadow_map_size, shadow_map_size},
+	.layerCount = 1,
+	.pDepthAttachment = &depth_attachment,
+};
+
+vkCmdBeginRenderingKHR(cmd, &rendering_info);
+
+
+Начинаем динамический рендеринг для записи глубины
+VkViewport viewport{
+	.x = 0.0f, .y = 0.0f,
+	.width = float(shadow_map_size),
+	.height = float(shadow_map_size),
+	.minDepth = 0.0f, .maxDepth = 1.0f,
+};
+
+vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+// Добавляем смещение при записи глубины 1.25 
+vkCmdSetDepthBias(cmd, 1.25f, 0.0f, 1.0f);
+
+VkRect2D scissor = {0, 0, shadow_map_size, shadow_map_size};
+vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+Рисуем как раньше, но со специальным набором дескрипторов для конвейера, рисующего глубины сцены
+
+for (size_t i = 0, n = models.size(); i < n; ++i) {
+	// Биндим вершинные и индексные буферы…
+
+	uint32_t offset = i * model_uniforms_alignment;
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            shadow.pipeline_layout, 0, 1,
+                            &shadow.descriptor_set, 1, &offset);
+
+	// Рисуем с помощью vkCmdDrawIndexed
+}
+
+vkCmdEndRenderingKHR(cmd);
+
+Не забудем перевести изображение в формат, оптимальный для чтения из шейдера
+
+Сейчас наша текстура глубины находится в формате оптимальном для записи с помощью конвейера (VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+Теперь нужно перевести текстуру в формат, оптимальный для чтения из шейдера (VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+Попробуйте изменить код последнего слайда на рисование вне экрана (#7), чтобы перевод формата был для текстуры глубины, а не для текстуры цвета
+Подсказка: в функции vkCmdPipelineBarrier мы должны подождать до этапа тестирования глубины (EARLY/LATE_FRAGMENT_TESTS), а не записи цвета (COLOR_ATTACHMENT_OUTPUT).  В структуре барьера нужно заменить все упоминания о цвете на глубину.
+Про этапы есть слайд с прошлого занятия с трубой, текущей вниз (17-й слайд)
+
+Как теперь тени рисовать?
+В описании типов наборов дескрипторов для основного графического конвейера нужно добавить новый биндинг COMBINED_SAMPLER для текстуры глубины, в которую мы нарисовали до того, как начать рисовать основную геометрию
+В месте, где происходит привязка дескрипторов нужно, очевидно, связать этот новый дескриптор с view текстуры глубины для теней
+В SceneUniforms нужно добавить матрицу проекции теней
+В основном вершинном шейдере нужно спроецировать точку поверхности треугольника с помощью матрицы проекции теней
+В основном фрагментном шейдере нужно указать новый дескриптор со специальным типом (sampler2DShadow)
+Сэмплировать текстуру глубины особым образом с указанием спроецированной точки, которая выходит из вершинного шейдера
+
+VkDescriptorSetLayoutBinding bindings[] = {
+	// Помимо других uniform буферов и текстур...
+	{
+		.binding = 4,
+		.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+		.descriptorCount = 1,
+		.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+	},
+};
+
+VkDescriptorSetLayoutCreateInfo info{ /* ... */ };
+
+vkCreateDescriptorSetLayout(device, &info, nullptr,
+			                &descriptor_set_layout);
+Добавим новый дескриптор для текстуры теней
+
+// Еще одна текстура для изображения глубины
+VkDescriptorImageInfo image_infos[textures_per_material + 1];
+
+image_infos[textures_per_material].sampler = shadow.sampler;
+image_infos[textures_per_material].imageView = shadow.depth_image_view;
+image_infos[textures_per_material].imageLayout =
+VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+
+VkWriteDescriptorSet write_infos[] = {
+	// Помимо других uniform буферов и текстур...
+	{
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.dstBinding = 4,
+		.descriptorCount = 1,
+		.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+		.pImageInfo = &image_infos[textures_per_material],
+};
+В коде привязки дескрипторов с ресурсами привязываем текстуру глубины
+
+struct SceneUniforms {
+	veekay::mat4 view_projection;
+	veekay::mat4 shadow_projection;
+	// Остальные данные...
+};
+
+В функции update нужно записать матрицу проекции теней в буфер SceneUniforms:
+
+	scene_uniforms.shadow_projection = shadow.matrix;
+Добавим матрицу проекции теней в данные о сцене 
+
+layout (location = 3) out vec4 f_shadow_position;
+
+layout (binding = 0, std140) uniform SceneUniforms {
+	mat4 view_projection;
+	mat4 shadow_projection;
+	// Остальные данные...
+};
+
+void main() {
+	vec4 position = model * vec4(v_position, 1.0f);
+	// ...пропущен код
+	f_shadow_position = shadow_projection * position;
+};
+В коде основного вершинного шейдера
+
+layout (location = 3) in vec4 f_shadow_position;
+
+layout (binding = 4) uniform sampler2DShadow shadow_texture;
+
+void main() {
+// f_shadow_position еще не спроецирован и координаты X и Y
+// находятся вне текстурных координат. Что тут надо сделать? 
+vec3 shadow_position = ...;
+
+// Сэмплирование текстуры глубины, возвращает 0.0 или 1.0,
+// если спроецированная точка в тени или в нее соответственно
+float shadow = texture(shadow_texture, shadow_position).r;
+В коде основного фрагментного шейдера
